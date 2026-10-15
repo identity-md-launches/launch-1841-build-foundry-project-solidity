@@ -31,13 +31,19 @@ An item ID can be zero. Several seasons can sell at the same time.
    it is not used as the random seed.
 4. For zero-based box index `i`, the seed is exactly
    `keccak256(abi.encode(prevRandao, block.chainid, address(this), purchaseId, i))`.
-   The contract takes this number modulo the total available weight, then walks
-   entries in their original order. Block hash, timestamp, coinbase and extraData
-   do not enter the seed. The block where `open` runs does not supply randomness.
+   The contract takes this number modulo the season's **full original weight**
+   (the sum of every entry's weight, sold out or not), then walks entries in their
+   original order. The selected entry therefore depends only on the seed and the
+   season terms, never on which other purchases opened first. If the selected
+   entry has already sold out, that box receives the fallback piece instead.
+   Block hash, timestamp, coinbase and extraData do not enter the seed. The block
+   where `open` runs does not supply randomness.
 5. The selected entries are counted and minted to the recorded buyer in one
    `mintBatch` call. The purchase is marked opened and caps are updated before
    that call. Both `buy` and `open` have a shared reentrancy guard. A rejected
-   receiver callback reverts the entire opening, which can then be retried.
+   receiver callback reverts the entire opening, which can then be retried; the
+   retry yields the same pieces, or the fallback for a pick that sold out in
+   between, so holding out never earns a better roll.
 
 This assumes an Ethereum proof-of-stake chain with Ethereum's execution-header
 and prevRandao semantics. It is not a VRF. **The validator proposing the block
@@ -57,24 +63,37 @@ overrides the ten-pack guarantee. There is no refund or cancellation of a paid
 purchase. Anyone may pay the gas to open for the buyer, even after sales close or
 while buying is paused.
 
-For a live ten-pack, index 9 rolls only among available Rare, Epic and Legendary
-entries, using their relative weights. If none remains at that moment, it uses
-the ordinary roll. The first nine boxes may consume the last rare entries.
-Smaller purchases have no tier guarantee.
+For a live ten-pack, index 9 is guaranteed Rare, Epic or Legendary while any such
+entry is still available. It first selects over the full original weight of every
+tier 2–4 entry, using their relative weights. Only if that selected rare has sold
+out does a derived seed re-roll among the rare entries still available. If no rare
+entry remains at that moment, it uses the ordinary roll. The first nine boxes may
+consume the last rare entries. Smaller purchases have no tier guarantee.
 
 Each pick updates the simulated availability before the next pick. A sold-out
-entry has no weight and cannot roll again. Caps are **per season and per item**,
-not global collection limits. Other seasons or authorized furniture minters may
-mint the same piece ID. Weights describe current eligible entries, not permanent
-odds: selling out a piece changes later odds. Opening order can therefore change
-results when caps apply.
+entry cannot be minted again; a pick that lands on it becomes the fallback. Caps
+are **per season and per item**, not global collection limits. Other seasons or
+authorized furniture minters may mint the same piece ID. Weights are permanent
+odds of being selected; the odds of actually receiving a capped piece fall to zero
+once it sells out, and that share goes to the fallback.
+
+Because every pick is fixed by its seed, another purchase opening can only make a
+pending result worse, never better: it can sell out the piece a pending box
+selected, which then degrades to the fallback. Capped pieces go to whoever opens
+first, so a buyer who wants a capped piece should open promptly. The one
+state-dependent step is the ten-pack re-roll: when the rare a tenth box selected
+sells out, its re-roll among the remaining rares may land on a higher or lower
+tier. A buyer cannot force that sell-out beyond opening other people's purchases
+that would receive that piece anyway, which gives those buyers exactly their own
+rolls. There is no other ordering game and no way to choose among outcomes.
 
 `previewOpen(purchaseId, prevRandao)` uses the same roll function and cap accounting
 as `open`. It requires an existing, unopened purchase past its target block. It
 does not authenticate the supplied prevRandao, reserve pieces or change state.
 For a live purchase, supply the actual target header's mixHash. Its result matches
-an immediate opening against the same state; other openings can consume caps in
-between. After expiry, preview ignores the supplied value and returns fallbacks.
+an immediate opening against the same state; a sell-out in between can only replace
+a pick with the fallback (or re-roll a guaranteed tenth box as described). After
+expiry, preview ignores the supplied value and returns fallbacks.
 
 ## Payments
 
@@ -99,8 +118,15 @@ that lies about balances is outside that assumption.
 Successful purchases leave the box's token balance unchanged at zero. The vault
 cannot be the box itself. As with any address, someone can send it unsolicited
 ERC-20 tokens; the box cannot prevent that and has no recovery/sweep function.
-A buyer who is also a payment recipient cannot satisfy the net-receipt check for
-a nonzero self-transfer, so that purchase reverts. A zero-value leg is skipped.
+A buyer who is also a payment recipient (for example the vault wallet buying
+boxes for a giveaway) pays itself on that leg; the check for that leg is only that
+its balance does not fall, so a standard token passes and a token that charges a
+fee on the self-transfer still reverts. A zero-value leg is skipped.
+
+`buy` also reverts with `BoxNotMinter` unless the furniture contract currently
+authorizes the box as a minter, so no payment is ever taken for a purchase that
+could not be opened. Sales therefore start only after the post-deployment
+`setMinter` step and stop automatically while that permission is revoked.
 
 ## What the owners can and cannot do
 
@@ -133,8 +159,16 @@ Ownership itself grants **no ability to move, burn or confiscate anyone's
 furniture**. Holders and operators they approve retain standard ERC-1155 transfer
 rights. There is no public burn function. The owner can authorize itself or
 others to mint new tokens. It can revoke the box's minter authorization, which
-would cause openings to revert until restored. Maintaining that permission is
-an operational responsibility of the furniture owner.
+stops new sales and makes openings revert until restored. If it stays revoked
+until a pending purchase passes `targetBlock + 256`, that purchase's live roll is
+lost and it opens as fallbacks, so the furniture owner must not revoke the box
+while purchases are pending. Maintaining that permission is an operational
+responsibility of the furniture owner, who may be a different account from the
+box owner.
+
+Weights are bounded: a season's summed weights may not exceed `MAX_TOTAL_WEIGHT`
+(2^128), which keeps the modulo reduction of the 256-bit seed unbiased to within
+one part in 2^128 of the published odds.
 
 ## Deployment parameters and steps
 
@@ -159,7 +193,8 @@ directly for parameterized local tests, without environment variables.
 
 After deployment, the furniture owner must:
 
-1. Call `furniture.setMinter(box, true)` with the confirmed box address.
+1. Call `furniture.setMinter(box, true)` with the confirmed box address. Until
+   this is done every `buy` reverts with `BoxNotMinter`.
 2. Call `furniture.setBaseURI(...)` with the published metadata prefix. Check the
    files, then optionally call `freezeMetadata()`.
 
@@ -182,8 +217,13 @@ It supports execution headers through Prague. Check `cast keccak` of its output
 against the block's published hash before passing the hex bytes to `open`.
 Future forks that append header fields may require updating this off-chain
 encoder; the contract accepts additional trailing fields already. Use the block
-header itself, not the whole block or JSON encoding. A contract buyer must accept
-ERC-1155 single and batch receiver callbacks to receive its furniture.
+header itself, not the whole block or JSON encoding. **A contract buyer must
+implement the ERC-1155 single and batch receiver callbacks.** The box does not
+call the buyer to check this (its only external calls are to the token and the
+furniture), and a purchase can only ever be delivered to its recorded buyer, so a
+contract without those callbacks pays for a purchase that can never be opened,
+even after expiry. This is a hard limitation; use an EOA or a receiver-capable
+wallet.
 
 `getSeason(id)` and `getEntries(id)` expose season terms. `minted(seasonId,itemId)`
 and `purchases(id)` expose accounting. Index `SeasonCreated`, `SeasonEntry`,
@@ -211,7 +251,10 @@ filesystem permissions, or FFI are required. Real mainnet headers from Shanghai,
 Cancun and Prague are embedded, with their original published fields and hashes
 under [test/fixtures](test/fixtures/SOURCES.md). The suite covers payment splits,
 malformed headers, all sale/reveal boundaries, access control, ownership, caps,
-ten-packs, callback rollback and reentrancy. A statistical test samples 20,000
+ten-packs, callback rollback and reentrancy. `test/FixedOdds.t.sol` checks that
+another purchase's opening never re-maps a pending roll, that a rejected delivery
+retried after a sell-out yields the same pieces, and that a sell-out only
+degrades the pick that landed on the sold-out piece. A statistical test samples 20,000
 prevRandao values derived from fuzz entropy and checks each no-cap frequency
 within one percentage point of its weight share. It suspends gas metering only
 for those independent view queries. Stateful invariants check custody, payment

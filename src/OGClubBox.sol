@@ -46,6 +46,8 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
     uint256 public constant BPS = 10_000;
     uint256 public constant TARGET_DELAY = 3;
     uint256 public constant REVEAL_WINDOW = 256;
+    /// @notice Upper bound of a season's summed weights, so `seed % totalWeight` is unbiased to within 2^-128.
+    uint256 public constant MAX_TOTAL_WEIGHT = 1 << 128;
 
     IERC20 public immutable token;
     OGClubFurniture public immutable furniture;
@@ -71,6 +73,7 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
     error SeasonAlreadyStarted(uint256 seasonId);
     error SalesUnavailable(uint256 seasonId);
     error BuyingPaused();
+    error BoxNotMinter();
     error InvalidCount();
     error PaymentOverflow();
     error ShortTransfer(address recipient, uint256 expected, uint256 received);
@@ -119,7 +122,7 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Create a season with permanent terms and at least one unlimited Common fallback.
-    /// @dev IDs start at 1. Weight totals must fit uint256. Seasons may overlap.
+    /// @dev IDs start at 1. Summed weights may not exceed MAX_TOTAL_WEIGHT. Seasons may overlap.
     function createSeason(
         uint256 price,
         uint256 opensAt,
@@ -135,7 +138,7 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
         for (uint256 i; i < entries.length; ++i) {
             Entry calldata entry = entries[i];
             if (entry.tier > 4 || entry.weight == 0) revert InvalidEntry(i);
-            if (entry.weight > type(uint256).max - totalWeight) revert WeightOverflow();
+            if (entry.weight > MAX_TOTAL_WEIGHT - totalWeight) revert WeightOverflow();
             totalWeight += entry.weight;
             for (uint256 j; j < i; ++j) {
                 if (entry.itemId == entries[j].itemId) revert DuplicateItem(entry.itemId);
@@ -184,6 +187,8 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
 
     /// @notice Pay for 1–10 boxes and commit to a target three blocks in the future.
     /// @dev Both payment legs go directly from the buyer to their recipients. A revert is atomic.
+    ///      Sales require the furniture contract to currently authorize this box as a minter, so no
+    ///      payment is taken for a purchase that could not open.
     function buy(uint256 seasonId, uint256 count) external nonReentrant returns (uint256 purchaseId) {
         Season storage season = _season(seasonId);
         if (count == 0 || count > 10) revert InvalidCount();
@@ -191,6 +196,7 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
         if (season.closed || block.timestamp < season.opensAt || block.timestamp >= season.closesAt) {
             revert SalesUnavailable(seasonId);
         }
+        if (!furniture.minters(address(this))) revert BoxNotMinter();
         if (season.price > type(uint256).max / count) revert PaymentOverflow();
         uint256 total = season.price * count;
         uint256 burnAmt = Math.mulDiv(total, season.burnBps, BPS);
@@ -231,7 +237,8 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
 
     /// @notice Predict an open using current caps and the supplied prevRandao (not authenticated by this view).
     /// @dev Same readiness checks and roll path as open. Expired previews ignore prevRandao.
-    ///      Other opens can consume caps and change a later result; this view does not reserve items.
+    ///      Another open can only sell out a capped entry, which degrades a pending pick of that entry to the
+    ///      fallback (or re-rolls a guaranteed tenth box among the remaining rares); this view reserves nothing.
     function previewOpen(uint256 purchaseId, bytes32 prevRandao) external view returns (uint256[] memory itemIds) {
         Purchase memory purchase = _openable(purchaseId);
         (itemIds,) = _roll(purchaseId, purchase, prevRandao, block.number - purchase.targetBlock > REVEAL_WINDOW);
@@ -254,13 +261,16 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
         vault = newVault;
     }
 
+    /// @dev A recipient must gain the full amount. A recipient paying itself keeps its balance instead, so that
+    ///      leg only requires no loss; a self-transfer that loses tokens still reverts.
     function _pay(address recipient, uint256 amount) private {
         if (amount == 0) return;
         uint256 beforeBalance = token.balanceOf(recipient);
         token.safeTransferFrom(msg.sender, recipient, amount);
         uint256 afterBalance = token.balanceOf(recipient);
+        uint256 expected = recipient == msg.sender ? 0 : amount;
         uint256 received = afterBalance >= beforeBalance ? afterBalance - beforeBalance : 0;
-        if (received < amount) revert ShortTransfer(recipient, amount, received);
+        if (afterBalance < beforeBalance || received < expected) revert ShortTransfer(recipient, expected, received);
     }
 
     function _season(uint256 seasonId) private view returns (Season storage season) {
@@ -292,42 +302,99 @@ contract OGClubBox is Ownable2Step, ReentrancyGuard {
         }
 
         Entry[] storage entries = _entries[purchase.seasonId];
-        uint256[] memory counts = new uint256[](entries.length);
-        for (uint256 j; j < entries.length; ++j) {
-            counts[j] = minted[purchase.seasonId][entries[j].itemId];
-        }
-        for (uint256 i; i < purchase.count; ++i) {
-            uint256 seed = uint256(keccak256(abi.encode(prevRandao, block.chainid, address(this), purchaseId, i)));
-            uint256 picked = _pick(entries, counts, seed, purchase.count == 10 && i == 9);
-            ids[i] = entries[picked].itemId;
-            tiers[i] = entries[picked].tier;
-            ++counts[picked];
+        uint256[] memory picks = _picks(purchaseId, purchase, prevRandao, entries);
+        for (uint256 i; i < picks.length; ++i) {
+            ids[i] = entries[picks[i]].itemId;
+            tiers[i] = entries[picks[i]].tier;
         }
     }
 
-    function _pick(Entry[] storage entries, uint256[] memory counts, uint256 seed, bool guarantee)
+    /// @dev Entry index chosen for every box of a live purchase, with cap depletion simulated across the pack.
+    function _picks(uint256 purchaseId, Purchase memory purchase, bytes32 prevRandao, Entry[] storage entries)
+        private
+        view
+        returns (uint256[] memory picks)
+    {
+        picks = new uint256[](purchase.count);
+        uint256[] memory counts = new uint256[](entries.length);
+        uint256 fallbackItem = _seasons[purchase.seasonId].fallbackItem;
+        uint256 fallbackIndex;
+        for (uint256 j; j < entries.length; ++j) {
+            counts[j] = minted[purchase.seasonId][entries[j].itemId];
+            if (entries[j].itemId == fallbackItem) fallbackIndex = j;
+        }
+        for (uint256 i; i < purchase.count; ++i) {
+            uint256 seed = uint256(keccak256(abi.encode(prevRandao, block.chainid, address(this), purchaseId, i)));
+            picks[i] = _pick(entries, counts, seed, fallbackIndex, purchase.count == 10 && i == 9);
+            ++counts[picks[i]];
+        }
+    }
+
+    /// @dev Fixed-odds pick. The seed selects over the season's full original weight, so the selected entry
+    ///      depends only on the seed and never on which other purchases opened first. A selected entry that
+    ///      has already sold out degrades to the fallback; a sell-out can therefore never improve a pending
+    ///      pick. A guaranteed tenth box is handled by _pickRare first and falls through when no rare is left.
+    function _pick(
+        Entry[] storage entries,
+        uint256[] memory counts,
+        uint256 seed,
+        uint256 fallbackIndex,
+        bool guarantee
+    ) private view returns (uint256) {
+        if (guarantee) {
+            (bool found, uint256 rare) = _pickRare(entries, counts, seed);
+            if (found) return rare;
+        }
+        uint256 totalWeight;
+        for (uint256 j; j < entries.length; ++j) {
+            totalWeight += entries[j].weight;
+        }
+        uint256 picked = _walk(entries, counts, seed % totalWeight, false, false);
+        return _available(entries[picked], counts[picked]) ? picked : fallbackIndex;
+    }
+
+    /// @dev Guaranteed tenth box: select over the full original weight of every tier >= 2 entry. Only when that
+    ///      selection has sold out does a derived seed re-roll among the rares still available, keeping the
+    ///      guarantee while one remains. Returns found = false when no rare entry is available.
+    function _pickRare(Entry[] storage entries, uint256[] memory counts, uint256 seed)
+        private
+        view
+        returns (bool found, uint256 picked)
+    {
+        uint256 rareWeight;
+        uint256 availableRareWeight;
+        for (uint256 j; j < entries.length; ++j) {
+            Entry storage entry = entries[j];
+            if (entry.tier < 2) continue;
+            rareWeight += entry.weight;
+            if (_available(entry, counts[j])) availableRareWeight += entry.weight;
+        }
+        if (availableRareWeight == 0) return (false, 0);
+        picked = _walk(entries, counts, seed % rareWeight, true, false);
+        if (!_available(entries[picked], counts[picked])) {
+            uint256 retry = uint256(keccak256(abi.encode(seed)));
+            picked = _walk(entries, counts, retry % availableRareWeight, true, true);
+        }
+        return (true, picked);
+    }
+
+    function _available(Entry storage entry, uint256 count) private view returns (bool) {
+        return entry.cap == 0 || count < entry.cap;
+    }
+
+    /// @dev Walk entries in original order, skipping those outside the requested pool, until the roll is spent.
+    function _walk(Entry[] storage entries, uint256[] memory counts, uint256 roll, bool rareOnly, bool availableOnly)
         private
         view
         returns (uint256)
     {
-        uint256 totalWeight;
-        uint256 rareWeight;
         for (uint256 j; j < entries.length; ++j) {
             Entry storage entry = entries[j];
-            if (entry.cap == 0 || counts[j] < entry.cap) {
-                totalWeight += entry.weight;
-                if (entry.tier >= 2) rareWeight += entry.weight;
-            }
+            if (rareOnly && entry.tier < 2) continue;
+            if (availableOnly && !_available(entry, counts[j])) continue;
+            if (roll < entry.weight) return j;
+            roll -= entry.weight;
         }
-        bool rareOnly = guarantee && rareWeight != 0;
-        uint256 roll = seed % (rareOnly ? rareWeight : totalWeight);
-        for (uint256 j; j < entries.length; ++j) {
-            Entry storage entry = entries[j];
-            if ((entry.cap == 0 || counts[j] < entry.cap) && (!rareOnly || entry.tier >= 2)) {
-                if (roll < entry.weight) return j;
-                roll -= entry.weight;
-            }
-        }
-        revert NoAvailableItems(); // Unreachable: the unlimited fallback keeps totalWeight positive.
+        revert NoAvailableItems(); // Unreachable: every roll is below the summed weight of the walked pool.
     }
 }

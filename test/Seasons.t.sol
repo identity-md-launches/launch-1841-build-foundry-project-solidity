@@ -94,7 +94,32 @@ contract SeasonsTest is BoxTestBase {
         entries[0].weight = type(uint256).max;
         vm.expectRevert(OGClubBox.WeightOverflow.selector);
         box.createSeason(1, 1, 2, 0, 1, entries);
+        entries[0].weight = box.MAX_TOTAL_WEIGHT(); // Plus the other two weights exceeds the bound.
+        vm.expectRevert(OGClubBox.WeightOverflow.selector);
+        box.createSeason(1, 1, 2, 0, 1, entries);
         assertEq(box.seasonCount(), 1);
+        entries[0].weight = box.MAX_TOTAL_WEIGHT() - 40; // Sums to exactly the bound.
+        uint256 wide = box.createSeason(1, 1000, 100_000, 0, 1, entries);
+        assertEq(box.seasonCount(), 2);
+        vm.prank(buyer);
+        uint256 purchase = box.buy(wide, 10);
+        bytes32 randao = keccak256("widest weights");
+        bytes memory header = ready(purchase, randao);
+        assertOpenMatches(purchase, randao, header, false);
+    }
+
+    function test_BuyRequiresTheBoxToBeAnAuthorizedMinter() public {
+        furniture.setMinter(address(box), false);
+        uint256 beforeBuyer = token.balanceOf(buyer);
+        vm.expectRevert(OGClubBox.BoxNotMinter.selector);
+        buy(1);
+        assertEq(token.balanceOf(buyer), beforeBuyer);
+        assertEq(token.balanceOf(vault), 0);
+        assertEq(token.balanceOf(box.BURN_ADDRESS()), 0);
+        assertEq(box.purchaseCount(), 0);
+        furniture.setMinter(address(box), true);
+        buy(1);
+        assertEq(box.purchaseCount(), 1);
     }
 
     function test_MaximumEntryCountAndIdZeroSupported() public {
