@@ -79,11 +79,14 @@ contract EdgeCasesTest is BoxTestBase {
         assertEq(box.minted(season, 9), 10);
     }
 
-    function test_TotalWeightMayEqualUint256Max() public {
+    function test_TotalWeightMayEqualMaxTotalWeightButNotExceedIt() public {
+        uint256 maxTotal = box.MAX_TOTAL_WEIGHT();
+        assertEq(maxTotal, 1 << 128);
         OGClubBox.Entry[] memory entries = new OGClubBox.Entry[](3);
-        entries[0] = OGClubBox.Entry(1, 0, type(uint256).max - 10, 0);
+        entries[0] = OGClubBox.Entry(1, 0, maxTotal - 10, 0);
         entries[1] = OGClubBox.Entry(2, 2, 7, 0);
         entries[2] = OGClubBox.Entry(3, 4, 3, 1);
+        // Summed weights of exactly MAX_TOTAL_WEIGHT are accepted and the season is fully usable.
         uint256 season = box.createSeason(1, 1000, 100_000, 0, 1, entries);
         vm.prank(buyer);
         uint256 purchase = box.buy(season, 10);
@@ -93,9 +96,28 @@ contract EdgeCasesTest is BoxTestBase {
         // Box 9 is guaranteed rare: the two rare entries share a weight of ten.
         assertTrue(expected[9] == 2 || expected[9] == 3);
         assertOpenMatches(purchase, randao, header, false);
+
+        // One more unit of weight anywhere in the list overflows the bound.
         entries[1].weight = 8;
         vm.expectRevert(OGClubBox.WeightOverflow.selector);
         box.createSeason(1, 1000, 100_000, 0, 1, entries);
+
+        // The bound is on the sum, so the overflow is caught at whichever entry crosses it, including the last.
+        entries[1].weight = 7;
+        entries[2].weight = 4;
+        vm.expectRevert(OGClubBox.WeightOverflow.selector);
+        box.createSeason(1, 1000, 100_000, 0, 1, entries);
+
+        // A single entry may carry the whole bound; a single entry above it is rejected.
+        OGClubBox.Entry[] memory one = new OGClubBox.Entry[](1);
+        one[0] = OGClubBox.Entry(1, 0, maxTotal, 0);
+        box.createSeason(1, 1000, 100_000, 0, 1, one);
+        one[0].weight = maxTotal + 1;
+        vm.expectRevert(OGClubBox.WeightOverflow.selector);
+        box.createSeason(1, 1000, 100_000, 0, 1, one);
+        one[0].weight = type(uint256).max;
+        vm.expectRevert(OGClubBox.WeightOverflow.selector);
+        box.createSeason(1, 1000, 100_000, 0, 1, one);
     }
 
     /// forge-config: default.fuzz.runs = 512
