@@ -1,0 +1,28 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "MockOG",
+      "constructorArgs": [
+        "$owner"
+      ]
+    },
+    {
+      "contract": "OGClubFurniture",
+      "constructorArgs": [
+        "$owner",
+        "$owner"
+      ]
+    },
+    {
+      "contract": "OGClubBox",
+      "constructorArgs": [
+        "$contract:MockOG",
+        "$contract:OGClubFurniture",
+        "$owner",
+        "$owner"
+      ]
+    }
+  ],
+  "notes": "Sepolia testnet launch of the OG Club lootbox application. MockOG (src/mocks/MockOG.sol) is the testnet payment token requested by the brief: ERC-20 'Mock OG', symbol mockog, 18 decimals, 1,000,000,000,000 tokens minted to the owner at construction, public mint for test funds; constructor(initialRecipient) = $owner. OGClubFurniture (src/OGClubFurniture.sol) is the ERC-1155 furniture collection 'OG Club Furniture' / OGFURNI with ERC1155Supply, ERC2981 royalties and Ownable2Step; constructor(initialOwner, royaltyReceiver) = ($owner, $owner): the brief names no royalty wallet, so the owner receives the 5% default royalty and may change receiver/bps up to 10% later. OGClubBox (src/OGClubBox.sol) sells lootboxes for MockOG and opens them with commit-reveal randomness from the target block's prevRandao; constructor(token, furniture, vault, initialOwner) = ($contract:MockOG, $contract:OGClubFurniture, $owner, $owner): the brief names no vault wallet, so the unburned share of every sale is paid directly to the owner until the owner calls setVault. Constructors are nonpayable, make no external calls and check only for nonzero addresses, so deployment on an empty chain succeeds. Post-deploy steps for the owner: furniture.setMinter(box, true) so the box can mint, furniture.setBaseURI(...), then box.createSeason(...). No proxies, no delegatecall, no selfdestruct; the box never holds the payment token."
+}
